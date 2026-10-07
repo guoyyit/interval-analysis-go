@@ -63,7 +63,8 @@ _ = intervalanalysis.WriteJSON(os.Stdout, result)
    `break/continue`、提前 `return` 等结构；无法精确处理的结构按保守
    方式连接，不丢路径。`break` 在 `switch`/`select` case 内表示跳出
    该 `switch`/`select`；回退 `goto` 构成回边，与循环回边一样触发加宽，
-   保证收敛。
+   保证收敛。`range` 循环的迭代条件按未知处理（循环体与循环出口两边
+   均可达），键 / 值变量在每次迭代时被置为未知。
 2. 在 CFG 上做工作集混沌迭代，直到状态不动点。
 3. 仅在**循环回边**（含回退 `goto`）上、经过 `WidenAfter` 轮普通迭代后
    进行区间加宽（widen 到最近阈值或无穷），保证含循环函数有限步收敛。
@@ -79,7 +80,7 @@ _ = intervalanalysis.WriteJSON(os.Stdout, result)
 目标处），对每个变量取所有可达前驱路径的最小上界：
 
 - 变量在**所有**前驱上都有绑定 → 绑定区间的逐点 Join；
-- 变量只在**部分**前驱上有绑定 → 与另一侧的隐式 top  Join，结果为
+- 变量只在**部分**前驱上有绑定 → 与另一侧的隐式 top Join，结果为
   top（即不绑定）。因此“只在某条分支 / 某个 case 中赋值”的包级变量，
   在汇合后按全区间处理：作为除数会报告 `div_by_zero`，作为下标会报告
   `index_out_of_bounds`，参与可能溢出的运算会报告 `integer_overflow`；
