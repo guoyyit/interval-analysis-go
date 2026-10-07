@@ -57,6 +57,10 @@ func (t *transfer) exec(block *Block, entry *State) []*State {
 	case BranchReturn:
 		return []*State{st}
 	case BranchCond:
+		// The condition is evaluated for effects as well: calls inside it may
+		// modify escaping variables, and both successor states must reflect
+		// that (the call runs before the branch is taken).
+		t.evalForEffects(st, block.Cond)
 		yes := t.assume(st.Copy(), block.Cond, false)
 		no := t.assume(st.Copy(), block.Cond, true)
 		return []*State{yes, no}
@@ -80,8 +84,17 @@ func (t *transfer) execStmt(st *State, stmt ast.Stmt) {
 			_, _ = t.eval(st).evalInt(r)
 		}
 	case *ast.RangeStmt:
+		t.evalForEffects(st, s.X)
 		t.execRangeInit(st, s)
-	case *ast.SendStmt, *ast.GoStmt, *ast.DeferStmt:
+	case *ast.SendStmt:
+		t.evalForEffects(st, s.Chan)
+		t.evalForEffects(st, s.Value)
+		t.havocEscaping(st)
+	case *ast.GoStmt:
+		t.evalForEffects(st, s.Call)
+		t.havocEscaping(st)
+	case *ast.DeferStmt:
+		t.evalForEffects(st, s.Call)
 		t.havocEscaping(st)
 	case *ast.LabeledStmt:
 		t.execStmt(st, s.Stmt)
@@ -149,6 +162,11 @@ func (t *transfer) execAssign(st *State, s *ast.AssignStmt) {
 	ev := t.eval(st)
 	for _, rhs := range s.Rhs {
 		t.evalForEffects(st, rhs)
+	}
+	// Index/selector expressions on the left are evaluated for the store as
+	// well: a[i] = v performs the same bounds check as a read.
+	for _, lhs := range s.Lhs {
+		t.evalForEffects(st, lhs)
 	}
 	if len(s.Rhs) == 1 && len(s.Lhs) == 1 {
 		t.assignOne(st, s.Lhs[0], s.Rhs[0])
@@ -231,6 +249,8 @@ func (t *transfer) havocLHS(st *State, lhs ast.Expr) {
 func (t *transfer) execIncDec(st *State, s *ast.IncDecStmt) {
 	id, ok := s.X.(*ast.Ident)
 	if !ok {
+		// a[i]++ and similar: the index expression is still evaluated.
+		t.evalForEffects(st, s.X)
 		return
 	}
 	obj := t.cfg.Info.ObjectOf(id)
@@ -271,14 +291,47 @@ func (t *transfer) execRangeInit(st *State, s *ast.RangeStmt) {
 	havoc(s.Value)
 }
 
+// evalForEffects evaluates every integer-typed subexpression of expr so that
+// runtime-error checks (division, overflow, bounds) fire for expressions whose
+// values are not assigned anywhere, e.g. call arguments, sent values and index
+// expressions on the left of an assignment. Index expressions are checked
+// individually to cover nested indexing like a[i][j].
 func (t *transfer) evalForEffects(st *State, expr ast.Expr) {
 	ev := t.eval(st)
 	ast.Inspect(expr, func(n ast.Node) bool {
-		if ix, ok := n.(*ast.IndexExpr); ok {
-			ev.checkIndex(ix.X, ix.Index)
+		if call, ok := n.(*ast.CallExpr); ok {
+			// A call may modify escaping variables (including package-level
+			// ones); forget their values. Builtins and conversions are pure.
+			if !isBuiltinCall(t.cfg.Info, call) && !ev.isConversion(call) {
+				t.havocEscaping(st)
+			}
+			return true
+		}
+		e, ok := n.(ast.Expr)
+		if !ok {
+			return true
+		}
+		if _, isIndex := e.(*ast.IndexExpr); isIndex {
+			// evalInt performs the bounds check for this access.
+			_, _ = ev.evalInt(e)
+			return true
+		}
+		if hasIntType(t.cfg.Info, e) {
+			_, _ = ev.evalInt(e)
 		}
 		return true
 	})
+}
+
+// isBuiltinCall reports whether c invokes a predeclared builtin (len, append,
+// ...), none of which mutate tracked variables.
+func isBuiltinCall(info *types.Info, c *ast.CallExpr) bool {
+	id, ok := c.Fun.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	_, isBuiltin := info.Uses[id].(*types.Builtin)
+	return isBuiltin
 }
 
 func (t *transfer) havocEscaping(st *State) {

@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"sort"
 )
 
 // BranchKind describes how control leaves a basic block.
@@ -54,6 +55,17 @@ type CFG struct {
 	Info   *types.Info
 	Pkg    *types.Package
 	Func   *ast.FuncDecl
+	// labels maps a statement label to the block starting the labeled
+	// statement; gotos records goto edges in source order. Both are filled
+	// during construction and resolved by wireGotos.
+	labels map[string]*Block
+	gotos  []gotoEdge
+}
+
+// gotoEdge is an unresolved goto: control leaves block from for label name.
+type gotoEdge struct {
+	from *Block
+	name string
 }
 
 // BuildCFG constructs a CFG for fn. Every statement is reachable through the
@@ -68,10 +80,43 @@ func BuildCFG(fset *token.FileSet, info *types.Info, pkg *types.Package, fn *ast
 	}
 	g.Entry = g.newBlock("entry")
 	g.Exit = g.newBlock("exit")
+	g.labels = map[string]*Block{}
 	b := g.buildStmtList(fn.Body.List, g.Entry, []*Block{g.Exit})
 	b.addSucc(g.Exit)
+	g.wireGotos()
 	g.prune()
 	return g
+}
+
+// wireGotos resolves every recorded goto to its label block. A goto whose
+// target was created earlier is a backward jump, so the edge is marked as a
+// back-edge to trigger widening and keep the fixpoint convergent. Unresolved
+// labels (only possible in ill-typed input) stay sound by jumping to every
+// known label, or to the exit when the function has no labels.
+func (g *CFG) wireGotos() {
+	for _, ge := range g.gotos {
+		target, ok := g.labels[ge.name]
+		if ok {
+			if target.ID <= ge.from.ID {
+				ge.from.addBackEdge(target)
+			} else {
+				ge.from.addSucc(target)
+			}
+			continue
+		}
+		if len(g.labels) == 0 {
+			ge.from.addSucc(g.Exit)
+			continue
+		}
+		names := make([]string, 0, len(g.labels))
+		for name := range g.labels {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			ge.from.addSucc(g.labels[name])
+		}
+	}
 }
 
 func (g *CFG) newBlock(comment string) *Block {
@@ -85,6 +130,50 @@ type link struct {
 	breaks     []*Block
 	continues  []*Block
 	contIsBack []bool
+	// stmtLabels are labels of directly enclosing LabeledStmts, consumed by
+	// the next loop/switch/select statement (their labeled break/continue
+	// targets).
+	stmtLabels []string
+	// lbreaks/lcontinues resolve labeled break/continue statements to the
+	// targets of the loop/switch/select carrying that label.
+	lbreaks    map[string][]*Block
+	lcontinues map[string][]*Block
+	lcontBack  map[string][]bool
+}
+
+// bindLabels returns a copy of lk with the pending statement labels bound to
+// the break/continue targets of the immediately enclosing loop/switch/select.
+func (lk link) bindLabels(breaks, continues []*Block, contBack []bool) link {
+	out := lk
+	if len(lk.stmtLabels) == 0 {
+		return out
+	}
+	out.lbreaks = cloneBlockTargets(lk.lbreaks)
+	out.lcontinues = cloneBlockTargets(lk.lcontinues)
+	out.lcontBack = cloneBackTargets(lk.lcontBack)
+	for _, name := range lk.stmtLabels {
+		out.lbreaks[name] = breaks
+		out.lcontinues[name] = continues
+		out.lcontBack[name] = contBack
+	}
+	out.stmtLabels = nil
+	return out
+}
+
+func cloneBlockTargets(m map[string][]*Block) map[string][]*Block {
+	out := make(map[string][]*Block, len(m)+1)
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneBackTargets(m map[string][]bool) map[string][]bool {
+	out := make(map[string][]bool, len(m)+1)
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // buildStmtList appends stmts to cur and returns the block reached after the
@@ -106,13 +195,19 @@ func (g *CFG) buildStmtListLk(stmts []ast.Stmt, cur *Block, exits []*Block, lk l
 func (g *CFG) buildStmt(st ast.Stmt, cur *Block, exits []*Block, lk link) *Block {
 	switch s := st.(type) {
 	case *ast.DeclStmt, *ast.AssignStmt, *ast.IncDecStmt,
-		*ast.SendStmt, *ast.GoStmt, *ast.DeferStmt, *ast.EmptyStmt,
-		*ast.LabeledStmt:
-		if ls, ok := st.(*ast.LabeledStmt); ok {
-			return g.buildStmt(ls.Stmt, cur, exits, lk)
-		}
+		*ast.SendStmt, *ast.GoStmt, *ast.DeferStmt, *ast.EmptyStmt:
 		cur.Stmts = append(cur.Stmts, st)
 		return cur
+
+	case *ast.LabeledStmt:
+		// A label starts a new block so gotos can target it; control also
+		// falls through from the previous statement.
+		lb := g.newBlock("label:" + s.Label.Name)
+		cur.addSucc(lb)
+		g.labels[s.Label.Name] = lb
+		nlk := lk
+		nlk.stmtLabels = append(append([]string{}, lk.stmtLabels...), s.Label.Name)
+		return g.buildStmt(s.Stmt, lb, exits, nlk)
 
 	case *ast.ExprStmt:
 		cur.Stmts = append(cur.Stmts, st)
@@ -172,11 +267,13 @@ func (g *CFG) buildStmt(st ast.Stmt, cur *Block, exits []*Block, lk link) *Block
 			post.addBackEdge(head)
 			continueTarget = post
 		}
-		nlk := link{
-			breaks:     []*Block{after},
-			continues:  []*Block{continueTarget},
-			contIsBack: []bool{s.Post == nil},
-		}
+		brks := []*Block{after}
+		conts := []*Block{continueTarget}
+		backs := []bool{s.Post == nil}
+		nlk := lk.bindLabels(brks, conts, backs)
+		nlk.breaks = brks
+		nlk.continues = conts
+		nlk.contIsBack = backs
 		bEnd := g.buildStmtListLk(bodyList(s.Body), bodyB, exits, nlk)
 		if s.Post != nil {
 			bEnd.addSucc(continueTarget)
@@ -194,7 +291,13 @@ func (g *CFG) buildStmt(st ast.Stmt, cur *Block, exits []*Block, lk link) *Block
 		head.Cond = rangeGuard(s)
 		head.addSucc(bodyB)
 		head.addSucc(after)
-		nlk := link{breaks: []*Block{after}, continues: []*Block{head}, contIsBack: []bool{true}}
+		brks := []*Block{after}
+		conts := []*Block{head}
+		backs := []bool{true}
+		nlk := lk.bindLabels(brks, conts, backs)
+		nlk.breaks = brks
+		nlk.continues = conts
+		nlk.contIsBack = backs
 		bEnd := g.buildStmtListLk(bodyList(s.Body), bodyB, exits, nlk)
 		bEnd.addBackEdge(head)
 		return after
@@ -213,21 +316,24 @@ func (g *CFG) buildStmt(st ast.Stmt, cur *Block, exits []*Block, lk link) *Block
 		if s.Assign != nil {
 			entry.Stmts = append(entry.Stmts, s.Assign)
 		}
-		var prev *Block
+		brks := []*Block{after}
+		nlk := lk.bindLabels(brks, nil, nil)
+		nlk.breaks = brks
 		for _, st := range s.Body.List {
 			cc := st.(*ast.CaseClause)
 			cb := g.newBlock("typeswitch-case")
 			entry.addSucc(cb)
-			end := g.buildStmtListLk(cc.Body, cb, exits, lk)
+			end := g.buildStmtListLk(cc.Body, cb, exits, nlk)
 			end.addSucc(after)
-			prev = cb
 		}
-		_ = prev
 		entry.addSucc(after)
 		return after
 
 	case *ast.SelectStmt:
 		after := g.newBlock("after-select")
+		brks := []*Block{after}
+		nlk := lk.bindLabels(brks, nil, nil)
+		nlk.breaks = brks
 		for _, st := range s.Body.List {
 			comm := st.(*ast.CommClause)
 			cb := g.newBlock("select-case")
@@ -237,7 +343,7 @@ func (g *CFG) buildStmt(st ast.Stmt, cur *Block, exits []*Block, lk link) *Block
 				stmts = append(stmts, comm.Comm)
 			}
 			stmts = append(stmts, comm.Body...)
-			end := g.buildStmtListLk(stmts, cb, exits, lk)
+			end := g.buildStmtListLk(stmts, cb, exits, nlk)
 			end.addSucc(after)
 		}
 		cur.addSucc(after)
@@ -246,20 +352,50 @@ func (g *CFG) buildStmt(st ast.Stmt, cur *Block, exits []*Block, lk link) *Block
 	case *ast.BranchStmt:
 		switch s.Tok {
 		case token.BREAK:
-			for _, t := range lk.breaks {
+			targets := lk.breaks
+			if s.Label != nil {
+				if lt, ok := lk.lbreaks[s.Label.Name]; ok {
+					targets = lt
+				}
+			}
+			for _, t := range targets {
 				cur.addSucc(t)
+			}
+			if len(cur.Succs) == 0 {
+				// Ill-typed break with no target: stay sound by exiting.
+				for _, ex := range exits {
+					cur.addSucc(ex)
+				}
 			}
 			return g.newBlock("after-break")
 		case token.CONTINUE:
-			for i, t := range lk.continues {
-				if i < len(lk.contIsBack) && lk.contIsBack[i] {
+			targets := lk.continues
+			backs := lk.contIsBack
+			if s.Label != nil {
+				if lt, ok := lk.lcontinues[s.Label.Name]; ok {
+					targets = lt
+					backs = lk.lcontBack[s.Label.Name]
+				}
+			}
+			for i, t := range targets {
+				if i < len(backs) && backs[i] {
 					cur.addBackEdge(t)
 				} else {
 					cur.addSucc(t)
 				}
 			}
+			if len(cur.Succs) == 0 {
+				for _, ex := range exits {
+					cur.addSucc(ex)
+				}
+			}
 			return g.newBlock("after-continue")
+		case token.GOTO:
+			// Resolved after the whole body is built (labels may be forward).
+			g.gotos = append(g.gotos, gotoEdge{from: cur, name: s.Label.Name})
+			return g.newBlock("after-goto")
 		}
+		// FALLTHROUGH is wired by buildSwitch; anything else falls through.
 		return cur
 
 	default:
@@ -292,13 +428,26 @@ func (g *CFG) buildSwitch(init ast.Stmt, tag ast.Expr, body *ast.BlockStmt,
 		cur.addSucc(after)
 		return after
 	}
+	// break inside a case exits the switch, not an enclosing loop.
+	brks := []*Block{after}
+	nlk := lk.bindLabels(brks, nil, nil)
+	nlk.breaks = brks
 	var defaultBody []ast.Stmt
 	tagExpr := tag
 	tagless := tag == nil
 	if tagExpr == nil {
 		tagExpr = &ast.Ident{Name: "true"}
 	}
-	var caseConds []ast.Expr
+	// First pass: build the condition of every case and pre-create its body
+	// block, so a fallthrough at the end of a case can be wired to the body
+	// of the next one.
+	type caseInfo struct {
+		cond  ast.Expr
+		body  []ast.Stmt
+		bodyB *Block
+		falls bool
+	}
+	var cases []caseInfo
 	for _, st := range body.List {
 		cc := st.(*ast.CaseClause)
 		if len(cc.List) == 0 {
@@ -313,21 +462,32 @@ func (g *CFG) buildSwitch(init ast.Stmt, tag ast.Expr, body *ast.BlockStmt,
 				conds = append(conds, &ast.BinaryExpr{X: tagExpr, Op: token.EQL, Y: val})
 			}
 		}
-		cond := joinConds(conds, token.LOR)
-		caseConds = append(caseConds, cond)
+		caseBody, falls := stripFallthrough(cc.Body)
+		cases = append(cases, caseInfo{
+			cond:  joinConds(conds, token.LOR),
+			body:  caseBody,
+			bodyB: g.newBlock("switch-case-body"),
+			falls: falls,
+		})
+	}
+	for i, ci := range cases {
 		// cur is the conditional dispatch block; bodyB the case body.
-		bodyB := g.newBlock("switch-case-body")
 		nextB := g.newBlock("switch-next")
 		cur.Kind = BranchCond
-		cur.Cond = cond
-		cur.addSucc(bodyB)
+		cur.Cond = ci.cond
+		cur.addSucc(ci.bodyB)
 		cur.addSucc(nextB)
-		end := g.buildStmtListLk(cc.Body, bodyB, exits, lk)
-		end.addSucc(after)
+		end := g.buildStmtListLk(ci.body, ci.bodyB, exits, nlk)
+		if ci.falls && i+1 < len(cases) {
+			// fallthrough: execute the next case body unconditionally.
+			end.addSucc(cases[i+1].bodyB)
+		} else {
+			end.addSucc(after)
+		}
 		cur = nextB
 	}
 	if defaultBody != nil {
-		end := g.buildStmtListLk(defaultBody, cur, exits, lk)
+		end := g.buildStmtListLk(defaultBody, cur, exits, nlk)
 		end.addSucc(after)
 	} else {
 		// No default: remaining values fall through.
@@ -335,6 +495,18 @@ func (g *CFG) buildSwitch(init ast.Stmt, tag ast.Expr, body *ast.BlockStmt,
 	}
 	_ = tagExpr
 	return after
+}
+
+// stripFallthrough drops a trailing fallthrough statement from a case body and
+// reports its presence.
+func stripFallthrough(body []ast.Stmt) ([]ast.Stmt, bool) {
+	if len(body) == 0 {
+		return body, false
+	}
+	if bs, ok := body[len(body)-1].(*ast.BranchStmt); ok && bs.Tok == token.FALLTHROUGH {
+		return body[:len(body)-1], true
+	}
+	return body, false
 }
 
 func joinConds(cs []ast.Expr, op token.Token) ast.Expr {

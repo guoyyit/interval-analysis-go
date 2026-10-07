@@ -106,12 +106,27 @@ func (s *State) ForgetLen(obj types.Object) {
 	delete(s.length, obj)
 }
 
+// joinMaps merges src into dst pointwise. An absent binding means top (the
+// full range; see State.Get), so a key present on only one side joins with the
+// implicit top of the other side and becomes top. Top is kept in canonical
+// form: no binding at all. This is what makes control-flow merges sound: a
+// variable assigned on only some reachable paths must be top after the join,
+// never the narrow value of one path.
 func joinMaps(dst, src map[types.Object]Interval) {
 	for k, v := range src {
 		if old, ok := dst[k]; ok {
-			dst[k] = Join(old, v)
-		} else {
-			dst[k] = v
+			if j := Join(old, v); j.Top {
+				delete(dst, k)
+			} else {
+				dst[k] = j
+			}
+		}
+		// Key only in src: join with dst's implicit top -> top -> unmapped.
+	}
+	for k := range dst {
+		if _, ok := src[k]; !ok {
+			// Key only in dst: join with src's implicit top -> top.
+			delete(dst, k)
 		}
 	}
 }
@@ -173,15 +188,16 @@ func widenMap(old, cur map[types.Object]Interval, thresholds []int64) map[types.
 	for k, ci := range cur {
 		oi, ok := old[k]
 		if !ok {
-			out[k] = ci
+			// old side is implicitly top; widening against top stays top
+			// (canonical: unmapped). Never keep the narrower cur value here:
+			// widening must stay an upper bound of the join.
 			continue
 		}
 		if ci.Top {
-			out[k] = TopInterval
+			// Canonical form: top is the absence of a binding.
 			continue
 		}
 		if oi.Top {
-			out[k] = TopInterval
 			continue
 		}
 		bits, signed, typeOK := intKind(k.Type())
@@ -196,21 +212,19 @@ func widenMap(old, cur map[types.Object]Interval, thresholds []int64) map[types.
 			min, max := TypeBounds(bits, signed)
 			if signed {
 				if lo <= min && hi >= max {
-					out[k] = TopInterval
+					// Covers the whole type: canonical top (unmapped).
 					continue
 				}
 			} else {
 				if uint64(lo) <= uint64(min) && uint64(hi) >= uint64(max) {
-					out[k] = TopInterval
 					continue
 				}
 			}
 		}
 		if lo == minInt64Threshold && hi == maxInt64Threshold {
-			out[k] = TopInterval
-		} else {
-			out[k] = Interval{Lo: lo, Hi: hi}
+			continue
 		}
+		out[k] = Interval{Lo: lo, Hi: hi}
 	}
 	return out
 }

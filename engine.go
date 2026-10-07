@@ -77,7 +77,7 @@ func normalizeConfig(cfg Config) Config {
 	if cfg.WidenAfter <= 0 {
 		cfg.WidenAfter = defaultWidenAfter
 	}
-	if cfg.NarrowingPasses < 0 {
+	if cfg.NarrowingPasses <= 0 {
 		cfg.NarrowingPasses = defaultNarrowingPasses
 	}
 	return cfg
@@ -241,7 +241,10 @@ func (e *Engine) propagate(b *Block, outs []*State, in []*State,
 }
 
 // narrow performs bounded descending iteration. At a post-fixpoint a >= F(a),
-// so intersecting the current bound with F(a) cannot remove real values.
+// so intersecting the current bound with F(a) cannot remove real values. Every
+// block is narrowed against the JOIN of all its incoming edge states: meeting
+// per edge would be unsound, because values arriving via a different edge
+// could be cut below the real reachable set.
 func (e *Engine) narrow(ctx context.Context, cfg *CFG, tr *transfer,
 	in, out []*State) bool {
 	for pass := 0; pass < e.config.NarrowingPasses; pass++ {
@@ -249,6 +252,11 @@ func (e *Engine) narrow(ctx context.Context, cfg *CFG, tr *transfer,
 			return false
 		}
 		changed := false
+		// Joined incoming edge state per block.
+		incoming := make([]*State, len(cfg.Blocks))
+		for i := range incoming {
+			incoming[i] = BottomState
+		}
 		for _, b := range cfg.Blocks {
 			outs := tr.exec(b, in[b.ID])
 			newOut := joinOuts(b, outs)
@@ -263,12 +271,18 @@ func (e *Engine) narrow(ctx context.Context, cfg *CFG, tr *transfer,
 				} else if len(outs) == 1 {
 					candidate = outs[0]
 				}
-				fresh := StateJoin(BottomState, candidate)
-				narrowed, okMeet := meetStates(in[succ.ID], fresh)
-				if okMeet && !StateEqual(narrowed, in[succ.ID]) {
-					in[succ.ID] = narrowed
-					changed = true
-				}
+				incoming[succ.ID] = StateJoin(incoming[succ.ID], candidate)
+			}
+		}
+		for _, b := range cfg.Blocks {
+			if incoming[b.ID].IsBottom() {
+				// No incoming edges (entry or unreachable): keep as is.
+				continue
+			}
+			narrowed, okMeet := meetStates(in[b.ID], incoming[b.ID])
+			if okMeet && !StateEqual(narrowed, in[b.ID]) {
+				in[b.ID] = narrowed
+				changed = true
 			}
 		}
 		if !changed {
@@ -295,6 +309,9 @@ func meetMap(dst, src map[types.Object]Interval) bool {
 	for k, v := range src {
 		old, ok := dst[k]
 		if !ok {
+			// dst side is implicitly top; meet(top, v) = v.
+			dst[k] = v
+			changed = true
 			continue
 		}
 		if m, ok := meetInterval(old, v); ok && m != old {
