@@ -171,3 +171,75 @@ func allCases(c int) int {
 		}
 	}
 }
+
+// A merged value that may exceed its declared type's range must trigger an
+// overflow report when used in arithmetic.
+func TestMergePointOverflow(t *testing.T) {
+	src := `package p
+
+var small int8
+var u uint8
+
+func addAfterIf(x int) int8 {
+	if x > 0 {
+		small = 100
+	}
+	return small + small
+}
+
+func incAfterIf(x int) uint8 {
+	if x > 0 {
+		u = 200
+	}
+	return u + u
+}
+`
+	res := analyzeSrc(t, src, DefaultConfig())
+	if !res.Complete {
+		t.Fatalf("analysis incomplete: %v", res.Unfinished)
+	}
+	if !hasWarning(res.Warnings, "p.addAfterIf", CategoryIntegerOverflow) {
+		t.Errorf("merged int8 top + itself must warn overflow, got %+v", res.Warnings)
+	}
+	if !hasWarning(res.Warnings, "p.incAfterIf", CategoryIntegerOverflow) {
+		t.Errorf("merged uint8 top + itself must warn overflow, got %+v", res.Warnings)
+	}
+}
+
+// Statements after a range loop must be analyzed (the loop-exit edge is
+// reachable), and a loop variable reused across iterations must not keep a
+// stale pre-loop value.
+func TestRangeLoopExitAndReuse(t *testing.T) {
+	src := `package p
+
+var Big [8]int
+var Small [4]int
+var D int
+
+func rangeReuse() int {
+	i := 0
+	for i = range Big {
+	}
+	return Small[i]
+}
+
+func divAfterRange(x int) int {
+	for _, v := range Big {
+		if v > 0 {
+			D = 9
+		}
+	}
+	return 10 / D
+}
+`
+	res := analyzeSrc(t, src, DefaultConfig())
+	if !res.Complete {
+		t.Fatalf("analysis incomplete: %v", res.Unfinished)
+	}
+	if !hasWarning(res.Warnings, "p.rangeReuse", CategoryIndexOutOfBounds) {
+		t.Errorf("reused range variable must be top after loop, got %+v", res.Warnings)
+	}
+	if !hasWarning(res.Warnings, "p.divAfterRange", CategoryDivByZero) {
+		t.Errorf("package var assigned only inside range loop must warn, got %+v", res.Warnings)
+	}
+}

@@ -284,6 +284,10 @@ func (g *CFG) buildStmt(st ast.Stmt, cur *Block, exits []*Block, lk link) *Block
 
 	case *ast.RangeStmt:
 		head := g.newBlock("range-head")
+		// The range statement itself executes at the head: the ranged
+		// expression is evaluated and the key/value variables take unknown
+		// values on every iteration (handled by the transfer function).
+		head.Stmts = append(head.Stmts, s)
 		cur.addSucc(head)
 		bodyB := g.newBlock("range-body")
 		after := g.newBlock("after-range")
@@ -413,9 +417,11 @@ func bodyList(b *ast.BlockStmt) []ast.Stmt {
 }
 
 func rangeGuard(s *ast.RangeStmt) ast.Expr {
-	// Placeholder condition: true while iterating. Precise range widening of the
-	// key/value is handled by havocing them in the transfer function.
-	return &ast.Ident{Name: "true"}
+	// Unknown iteration condition: both the body and the after-loop edges
+	// stay reachable, with no refinement on either. A constant true here
+	// would make the loop-exit edge unreachable and silently skip every
+	// statement after a range loop.
+	return nil
 }
 
 func (g *CFG) buildSwitch(init ast.Stmt, tag ast.Expr, body *ast.BlockStmt,

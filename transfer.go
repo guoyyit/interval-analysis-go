@@ -59,8 +59,11 @@ func (t *transfer) exec(block *Block, entry *State) []*State {
 	case BranchCond:
 		// The condition is evaluated for effects as well: calls inside it may
 		// modify escaping variables, and both successor states must reflect
-		// that (the call runs before the branch is taken).
-		t.evalForEffects(st, block.Cond)
+		// that (the call runs before the branch is taken). A nil condition
+		// (e.g. range guards) refines neither successor.
+		if block.Cond != nil {
+			t.evalForEffects(st, block.Cond)
+		}
 		yes := t.assume(st.Copy(), block.Cond, false)
 		no := t.assume(st.Copy(), block.Cond, true)
 		return []*State{yes, no}

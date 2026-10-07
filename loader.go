@@ -79,6 +79,14 @@ func LoadPackages(ctx context.Context, dir string, recursive bool) ([]*LoadedPac
 }
 
 func packageDirs(root string, recursive bool) ([]string, error) {
+	// A missing or unreadable root must surface as an error: silently
+	// analyzing zero packages would produce a "complete, no warnings"
+	// conclusion for a target that was never looked at.
+	if st, err := os.Stat(root); err != nil {
+		return nil, err
+	} else if !st.IsDir() {
+		return nil, &os.PathError{Op: "stat", Path: root, Err: os.ErrInvalid}
+	}
 	if !recursive {
 		if hasGoFiles(root) {
 			return []string{root}, nil

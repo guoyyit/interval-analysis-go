@@ -2,6 +2,7 @@ package intervalanalysis
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 )
 
@@ -273,5 +274,15 @@ func f(x int) int { return 1 / x }
 `, DefaultConfig())
 	if !clean.Complete || ExitCode(clean) != 0 {
 		t.Fatalf("complete analysis with warnings must exit 0: %+v", clean)
+	}
+}
+
+// A nonexistent target directory must surface as an error rather than a
+// "complete, zero warnings" conclusion about code that was never read.
+func TestNonexistentDirIsError(t *testing.T) {
+	a := NewAnalyzer(DefaultConfig())
+	_, err := a.Analyze(context.Background(), filepath.Join(t.TempDir(), "missing"), false)
+	if err == nil {
+		t.Fatal("analyzing a nonexistent directory must return an error")
 	}
 }
