@@ -26,6 +26,17 @@ type JSONReport struct {
 	Warnings   []JSONWarning `json:"warnings"`
 }
 
+// ExitCode maps an analysis result to the process exit status convention:
+// 0 when every target function reached a conservative fixpoint (the reported
+// warnings are a complete, trustworthy conclusion), 2 otherwise. Warnings
+// themselves do not affect the exit status; only completeness does.
+func ExitCode(r *Result) int {
+	if r == nil || !r.Complete {
+		return 2
+	}
+	return 0
+}
+
 // WriteJSON writes a deterministic JSON report.
 func WriteJSON(w io.Writer, r *Result) error {
 	rep := JSONReport{

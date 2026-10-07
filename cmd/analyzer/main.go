@@ -51,8 +51,8 @@ func run() error {
 			return err
 		}
 	}
-	if !result.Complete {
-		os.Exit(2)
+	if code := ia.ExitCode(result); code != 0 {
+		os.Exit(code)
 	}
 	return nil
 }
