@@ -147,6 +147,14 @@ func (t *transfer) initValue(st *State, obj types.Object, value ast.Expr) {
 
 func (t *transfer) execAssign(st *State, s *ast.AssignStmt) {
 	ev := t.eval(st)
+	// Index expressions on the left hand side are concrete indexing operations
+	// too: a write out of bounds panics exactly like a read, so every LHS index
+	// must be checked against the object length before the assignment.
+	for _, lhs := range s.Lhs {
+		if ix, ok := lhs.(*ast.IndexExpr); ok {
+			ev.checkIndex(ix.X, ix.Index)
+		}
+	}
 	for _, rhs := range s.Rhs {
 		t.evalForEffects(st, rhs)
 	}
@@ -229,6 +237,11 @@ func (t *transfer) havocLHS(st *State, lhs ast.Expr) {
 }
 
 func (t *transfer) execIncDec(st *State, s *ast.IncDecStmt) {
+	if ix, ok := s.X.(*ast.IndexExpr); ok {
+		// a[i]++/-- still evaluates i as an index and can panic out of bounds.
+		t.eval(st).checkIndex(ix.X, ix.Index)
+		return
+	}
 	id, ok := s.X.(*ast.Ident)
 	if !ok {
 		return

@@ -106,17 +106,31 @@ func (s *State) ForgetLen(obj types.Object) {
 	delete(s.length, obj)
 }
 
+// joinMaps computes the pointwise least upper bound over two maps in place in
+// dst. An absent binding means the full range of the key's declared type (top),
+// never bottom: if a key is bound on only one side, the merge cannot keep the
+// narrow value of that side, because the other side may carry any value of the
+// type. Such asymmetric bindings are therefore dropped (leaving the sound
+// default of an unbound/top variable).
 func joinMaps(dst, src map[types.Object]Interval) {
+	for k := range dst {
+		if _, ok := src[k]; !ok {
+			delete(dst, k)
+		}
+	}
 	for k, v := range src {
 		if old, ok := dst[k]; ok {
 			dst[k] = Join(old, v)
-		} else {
-			dst[k] = v
 		}
+		// Keys present only in src were already present in dst (or deleted
+		// above via the reverse scan); asymmetric keys must stay unbound.
 	}
 }
 
-// StateJoin is the pointwise lattice least upper bound.
+// StateJoin is the pointwise lattice least upper bound. A variable bound on one
+// side but not the other is unbound after the join: the missing side means the
+// variable may take any value of its type, so keeping either side's narrow
+// interval would be an unsound under-approximation at the control-flow merge.
 func StateJoin(a, b *State) *State {
 	if a.IsBottom() {
 		return b
@@ -173,7 +187,10 @@ func widenMap(old, cur map[types.Object]Interval, thresholds []int64) map[types.
 	for k, ci := range cur {
 		oi, ok := old[k]
 		if !ok {
-			out[k] = ci
+			// A binding that first appears on a loop back edge covers at least
+			// the pre-loop state (where the variable was unbound, hence full
+			// type range). Widening must jump straight to top.
+			out[k] = TopInterval
 			continue
 		}
 		if ci.Top {

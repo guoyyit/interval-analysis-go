@@ -155,7 +155,9 @@ func (e *Engine) fixpoint(ctx context.Context, cfg *CFG, tr *transfer,
 	in := make([]*State, n)
 	out := make([]*State, n)
 	counts := make([]int, n)
+	visits := make([]int, n)
 	lastWiden := make([]*State, n)
+	loopHead := backEdgeTargets(cfg)
 	for i := range in {
 		in[i] = BottomState
 		out[i] = BottomState
@@ -180,19 +182,34 @@ func (e *Engine) fixpoint(ctx context.Context, cfg *CFG, tr *transfer,
 		worklist = worklist[1:]
 		queued[b.ID] = false
 		iter++
+		visits[b.ID]++
 
 		succStates := tr.exec(b, in[b.ID])
 		newOut := joinOuts(b, succStates)
 		outChanged := !StateEqual(newOut, out[b.ID])
 		out[b.ID] = newOut
-		e.propagate(b, succStates, in, &worklist, queued, counts, lastWiden,
-			thresholds, outChanged)
+		e.propagate(b, succStates, in, &worklist, queued, counts, visits,
+			loopHead, lastWiden, thresholds, outChanged)
 	}
 
 	if converged {
 		converged = e.narrow(ctx, cfg, tr, in, out)
 	}
 	return in, out, converged
+}
+
+// backEdgeTargets reports blocks that are the destination of at least one back
+// edge (loop heads, including loops written with backward gotos).
+func backEdgeTargets(cfg *CFG) map[int]bool {
+	m := map[int]bool{}
+	for _, b := range cfg.Blocks {
+		for i, s := range b.Succs {
+			if i < len(b.BackEdge) && b.BackEdge[i] {
+				m[s.ID] = true
+			}
+		}
+	}
+	return m
 }
 
 func joinOuts(b *Block, outs []*State) *State {
@@ -206,8 +223,8 @@ func joinOuts(b *Block, outs []*State) *State {
 }
 
 func (e *Engine) propagate(b *Block, outs []*State, in []*State,
-	worklist *[]*Block, queued map[int]bool, counts []int,
-	lastWiden []*State, thresholds []int64, force bool) {
+	worklist *[]*Block, queued map[int]bool, counts, visits []int,
+	loopHead map[int]bool, lastWiden []*State, thresholds []int64, force bool) {
 	for i, succ := range b.Succs {
 		isBack := i < len(b.BackEdge) && b.BackEdge[i]
 		candidate := BottomState
@@ -220,14 +237,20 @@ func (e *Engine) propagate(b *Block, outs []*State, in []*State,
 		if isBack {
 			counts[succ.ID]++
 		}
-		if isBack && counts[succ.ID] > e.config.WidenAfter {
+		// Widen the input of a loop head once it has been re-entered enough
+		// times. Basing this on actual block visits (rather than only counting
+		// propagated back edges) is robust to worklist scheduling: forward
+		// predecessors can re-queue a head many times between two back-edge
+		// propagations. Widening is an upper-bound operator, so accelerating it
+		// never removes possible values.
+		if loopHead[succ.ID] && visits[succ.ID] > e.config.WidenAfter {
 			base := lastWiden[succ.ID]
 			if base == nil {
 				base = in[succ.ID]
 			}
 			joined = Widen(base, joined, thresholds)
-		}
-		if isBack {
+			lastWiden[succ.ID] = joined
+		} else if isBack {
 			lastWiden[succ.ID] = joined
 		}
 		if force || !StateEqual(joined, in[succ.ID]) {
